@@ -1,7 +1,59 @@
 import pandas as pd
 import eurostat
 import streamlit as st
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import time as _time
 
+# --- Local file cache ---
+_CACHE_DIR = Path(__file__).resolve().parent.parent / ".data_cache"
+_CACHE_MAX_AGE_HOURS = 6
+_START_YEAR = "1990"
+
+# All Eurostat dataset codes used by this app
+_ALL_DATASETS = ("prc_hicp_midx", "une_rt_m", "demo_pjan", "nama_10_gdp", "irt_lt_mcby_m", "gov_10dd_edpt1", "irt_st_m")
+
+
+def _cache_path(dataset_code: str) -> Path:
+    return _CACHE_DIR / f"{dataset_code}.parquet"
+
+
+def _is_cache_fresh(path: Path) -> bool:
+    if not path.exists():
+        return False
+    age_hours = (_time.time() - path.stat().st_mtime) / 3600
+    return age_hours < _CACHE_MAX_AGE_HOURS
+
+
+def _fetch_and_cache(dataset_code: str) -> pd.DataFrame:
+    """Fetch from Eurostat API and save to local parquet."""
+    path = _cache_path(dataset_code)
+    if _is_cache_fresh(path):
+        return pd.read_parquet(path)
+    df = eurostat.get_data_df(dataset_code)
+    _CACHE_DIR.mkdir(exist_ok=True)
+    df.to_parquet(path, index=False)
+    return df
+
+
+def prefetch_all():
+    """Fetch all datasets in parallel, saving to local parquet cache."""
+    stale = [d for d in _ALL_DATASETS if not _is_cache_fresh(_cache_path(d))]
+    if not stale:
+        return  # all cached — nothing to do
+    with ThreadPoolExecutor(max_workers=len(stale)) as pool:
+        list(pool.map(_fetch_and_cache, stale))
+
+
+def _get_dataset(dataset_code: str) -> pd.DataFrame:
+    """Read from local cache (fast) or fetch if stale."""
+    path = _cache_path(dataset_code)
+    if _is_cache_fresh(path):
+        return pd.read_parquet(path)
+    return _fetch_and_cache(dataset_code)
+
+
+# --- Helpers ---
 
 def _detect_time_cols(cols):
     out = []
@@ -21,30 +73,26 @@ def _to_datetime_index(idx):
         return pd.to_datetime(s, format="%Y-%m")
     if s.str.match(r"^\d{4}$").all():
         return pd.to_datetime(s + "-01-01", format="%Y-%m-%d")
-    return pd.to_datetime(s, errors="coercester")
+    return pd.to_datetime(s, errors="coerce")
 
 
 def _merge_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
-    
     if df.columns.duplicated().any():
-        df = df.groupby(level=0, axis=1).mean(numeric_only=True)
+        df = df.T.groupby(level=0).mean(numeric_only=True).T
     return df
 
 
+def _clip_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only rows from 1980 onward."""
+    return df[df.index >= "1990-01-01"]
+
+
 def _load_wide(dataset_code: str, geo_list, filters: dict, rename_geo=None):
-    """
-    Loads eurostat wide format:
-    - filters
-    - keeps only time columns
-    - ensures 1 row per geo (fixes duplicates)
-    - returns: index=datetime, columns=geo
-    """
-    df = eurostat.get_data_df(dataset_code)
+    df = _get_dataset(dataset_code).copy()
 
     geo_raw = "geo\\TIME_PERIOD" if "geo\\TIME_PERIOD" in df.columns else "geo"
     df["geo"] = df[geo_raw]
 
-    # filter geo + other filters
     mask = df["geo"].isin(list(geo_list))
     for k, v in (filters or {}).items():
         if k in df.columns:
@@ -52,59 +100,50 @@ def _load_wide(dataset_code: str, geo_list, filters: dict, rename_geo=None):
     df = df[mask].copy()
 
     time_cols = _detect_time_cols(df.columns)
-    df = df[["geo"] + time_cols].copy()
+    df = df[["geo"] + time_cols]
+    numeric = df[time_cols].apply(pd.to_numeric, errors="coerce")
+    numeric["geo"] = df["geo"].values
+    df = numeric.groupby("geo")[time_cols].mean()  # index = geo, cols = time
 
-    # numeric time columns
-    df[time_cols] = df[time_cols].apply(pd.to_numeric, errors="coerce")
-
-    # multiple rows per geo -> aggregate to 1 row per geo
-    df = df.groupby("geo", as_index=False)[time_cols].mean(numeric_only=True)
-
-    # wide -> time rows
-    out = df.set_index("geo").T
+    out = df.T
     out.index = _to_datetime_index(out.index)
     out = out.sort_index()
 
-    # rename geo codes
     if rename_geo:
         out = out.rename(columns=rename_geo)
 
-    #  rename can create duplicates -> merge duplicates safely
     out = _merge_duplicate_columns(out)
-
-    # drop empty columns
     out = out.dropna(axis=1, how="all")
 
-    return out
+    return _clip_dates(out)
 
 
+# --- Public loaders ---
 
-
-@st.cache_data
+@st.cache_data(ttl="6h")
 def load_inflation(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
-    # HICP Index 2015=100
+    # Include "EU" geo code which has data from 1996 (EU27_2020 only from 2000)
+    extended_geo = set(geo_list) | {"EU"}
     return _load_wide(
         "prc_hicp_midx",
-        geo_list,
+        extended_geo,
         filters={"coicop": "CP00", "unit": "I15"},
         rename_geo={"EU27_2020": "EU"},
     )
 
 
-@st.cache_data
+@st.cache_data(ttl="6h")
 def load_unemployment(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
-    # Monthly unemployment rate, seasonally adjusted
     return _load_wide(
         "une_rt_m",
         geo_list,
-        filters={"age": "Y15-74", "sex": "T", "unit": "PC_ACT", "s_adj": "SA"},
+        filters={"age": "TOTAL", "sex": "T", "unit": "PC_ACT", "s_adj": "SA"},
         rename_geo={"EU27_2020": "EU"},
     )
 
 
-@st.cache_data
+@st.cache_data(ttl="6h")
 def load_population(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
-    # Population on 1 January (yearly)
     return _load_wide(
         "demo_pjan",
         geo_list,
@@ -113,9 +152,8 @@ def load_population(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
     )
 
 
-@st.cache_data
+@st.cache_data(ttl="6h")
 def load_gdp(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
-    # GDP in million euro (yearly)
     return _load_wide(
         "nama_10_gdp",
         geo_list,
@@ -124,13 +162,10 @@ def load_gdp(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
     )
 
 
-@st.cache_data
+@st.cache_data(ttl="6h")
 def load_gdp_per_capita(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
-    """
-    GDP per capita (EUR/person) = GDP(MEUR)*1_000_000 / population
-    """
-    gdp = load_gdp(geo_list=geo_list)        # MEUR
-    pop = load_population(geo_list=geo_list) # persons
+    gdp = load_gdp(geo_list=geo_list)
+    pop = load_population(geo_list=geo_list)
 
     common_idx = gdp.index.intersection(pop.index)
     gdp = gdp.loc[common_idx]
@@ -138,38 +173,111 @@ def load_gdp_per_capita(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
 
     gdp_pc = (gdp * 1_000_000) / pop
     gdp_pc = gdp_pc.round(0)
-
     return gdp_pc.dropna(axis=1, how="all")
 
 
-@st.cache_data
-def load_interest_rates(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
-    """
-    irt_st_m can contain MANY rows per geo => we must aggregate.
-    We keep it simple: filter geo, keep time columns, mean per geo.
-    """
-    df = eurostat.get_data_df("irt_st_m")
+@st.cache_data(ttl="6h")
+def load_unemployment_detail(geo="SE"):
+    df = _get_dataset("une_rt_m").copy()
 
     geo_raw = "geo\\TIME_PERIOD" if "geo\\TIME_PERIOD" in df.columns else "geo"
     df["geo"] = df[geo_raw]
-
-    df = df[df["geo"].isin(list(geo_list))].copy()
+    df = df[(df["geo"] == geo) & (df["unit"] == "PC_ACT") & (df["s_adj"] == "SA")].copy()
 
     time_cols = _detect_time_cols(df.columns)
-    df = df[["geo"] + time_cols].copy()
 
-    df[time_cols] = df[time_cols].apply(pd.to_numeric, errors="coerce")
+    slices = {
+        "Total": (df["sex"] == "T") & (df["age"] == "TOTAL"),
+        "Men": (df["sex"] == "M") & (df["age"] == "TOTAL"),
+        "Women": (df["sex"] == "F") & (df["age"] == "TOTAL"),
+        "Under 25": (df["sex"] == "T") & (df["age"] == "Y_LT25"),
+        "25-74": (df["sex"] == "T") & (df["age"] == "Y25-74"),
+    }
 
-    df = df.groupby("geo", as_index=False)[time_cols].mean(numeric_only=True)
+    frames = {}
+    for label, mask in slices.items():
+        row = df.loc[mask, time_cols].apply(pd.to_numeric, errors="coerce")
+        if row.empty:
+            continue
+        series = row.mean()
+        frames[label] = series
 
-    out = df.set_index("geo").T
+    out = pd.DataFrame(frames)
     out.index = _to_datetime_index(out.index)
     out = out.sort_index()
+    return _clip_dates(out.dropna(how="all"))
 
-    # rename EU
-    out = out.rename(columns={"EU27_2020": "EU"})
 
-    #  merge duplicates if any
-    out = _merge_duplicate_columns(out)
+@st.cache_data(ttl="6h")
+def load_inflation_yoy(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
+    """Annual inflation rate (YoY % change of HICP index)."""
+    hicp = load_inflation(geo_list=geo_list)
+    yoy = hicp.pct_change(periods=12) * 100  # 12-month % change
+    return yoy.dropna(how="all")
 
-    return out.dropna(axis=1, how="all")
+
+@st.cache_data(ttl="6h")
+def load_debt_to_gdp(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
+    """Government gross debt as % of GDP (yearly). Norway not available.
+    EA20 included for earlier EU data (from 1995 vs EU27_2020 from 2000)."""
+    extended_geo = set(geo_list) | {"EA20"}
+    return _load_wide(
+        "gov_10dd_edpt1",
+        extended_geo,
+        filters={"unit": "PC_GDP", "sector": "S13", "na_item": "GD"},
+        rename_geo={"EU27_2020": "EU", "EA20": "EU"},
+    )
+
+
+@st.cache_data(ttl="6h")
+def load_interest_rates(geo_list=("SE", "EU27_2020", "DK", "FI", "NO")):
+    """
+    Long-term government bond yields (monthly).
+    Note: Norway (NO) is not available in Eurostat interest rate datasets.
+    """
+    extended_geo = set(geo_list) | {"EA", "EA20"}
+    return _load_wide(
+        "irt_lt_mcby_m",
+        extended_geo,
+        filters={},
+        rename_geo={"EU27_2020": "EU", "EA": "EU", "EA20": "EU"},
+    )
+
+
+@st.cache_data(ttl="6h")
+def load_interest_rates_detail(geo="SE"):
+    """Money market rates + long-term bond yield for a single country.
+    Returns DataFrame with columns: Day-to-day, 1-month, 3-month, 6-month, Govt bond 10Y."""
+    df = _get_dataset("irt_st_m").copy()
+    geo_raw = "geo\\TIME_PERIOD" if "geo\\TIME_PERIOD" in df.columns else "geo"
+    df["geo"] = df[geo_raw]
+    df = df[df["geo"] == geo].copy()
+
+    time_cols = _detect_time_cols(df.columns)
+
+    rate_map = {
+        "IRT_DTD": "Day-to-day",
+        "IRT_M1": "1-month",
+        "IRT_M3": "3-month",
+        "IRT_M6": "6-month",
+    }
+
+    frames = {}
+    for code, label in rate_map.items():
+        row = df.loc[df["int_rt"] == code, time_cols].apply(pd.to_numeric, errors="coerce")
+        if row.empty:
+            continue
+        frames[label] = row.mean()
+
+    # Add long-term govt bond yield from the other dataset
+    bond = _get_dataset("irt_lt_mcby_m").copy()
+    geo_raw2 = "geo\\TIME_PERIOD" if "geo\\TIME_PERIOD" in bond.columns else "geo"
+    bond["geo"] = bond[geo_raw2]
+    bond_row = bond.loc[bond["geo"] == geo, _detect_time_cols(bond.columns)].apply(pd.to_numeric, errors="coerce")
+    if not bond_row.empty:
+        frames["Govt bond 10Y"] = bond_row.mean()
+
+    out = pd.DataFrame(frames)
+    out.index = _to_datetime_index(out.index)
+    out = out.sort_index()
+    return _clip_dates(out.dropna(how="all"))
