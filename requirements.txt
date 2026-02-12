@@ -1,6 +1,5 @@
-
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import eurostat
-import requests
+streamlit
+pandas
+plotly
+eurostat
+pyarrow
