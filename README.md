@@ -76,4 +76,4 @@ The first run fetches all datasets from Eurostat (~10-15 seconds) and caches the
 - **pandas** -- data manipulation
 - **eurostat** -- Eurostat REST API client
 - **pyarrow** -- parquet file caching
-- ** Dashboard link -https://raselmian03-alt-eu-vs-sweden-streamlit-dashboard-app-qv9nez.streamlit.app/
+- Dashboard link -https://raselmian03-alt-eu-vs-sweden-streamlit-dashboard-app-qv9nez.streamlit.app/
